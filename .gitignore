@@ -15,4 +15,10 @@ local.properties
 *.tmp
 *.swp
 *.zip
+/*.apk
+/*.aab
+/app/release/
+/keystore/
+/store-assets/
+/tmp_recovery_images/
 !/gradle/wrapper/gradle-wrapper.jar
