@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.speech.RecognizerIntent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
@@ -201,6 +202,23 @@ private const val LEGACY_USER_DATA_OWNER_ACCOUNT_KEY = "legacy_user_data_owner_a
 private data class CardPaymentConfig(
     val closingDay: Int,
     val paymentDay: Int
+)
+
+private data class VoiceTransactionDraft(
+    val transcript: String,
+    val title: String,
+    val amount: Double,
+    val type: TransactionType,
+    val category: String,
+    val paymentMethod: String,
+    val installments: Int,
+    val launchDate: LocalDate
+)
+
+private data class SpeechNumberCandidate(
+    val raw: String,
+    val value: Double,
+    val priority: Int
 )
 
 private fun accountPhotoKey(accountId: Long): String = "$ACCOUNT_PHOTO_KEY_PREFIX$accountId"
@@ -500,6 +518,197 @@ private fun parseReminderTimeOrNull(raw: String): DailyReminderTime? {
     val minute = digits.drop(2).toIntOrNull() ?: return null
     if (hour !in 0..23 || minute !in 0..59) return null
     return DailyReminderTime(hour = hour, minute = minute)
+}
+
+private fun normalizeSpeechText(raw: String): String {
+    return Normalizer
+        .normalize(raw.lowercase(Locale.forLanguageTag("pt-BR")), Normalizer.Form.NFD)
+        .replace("\\p{M}+".toRegex(), "")
+        .replace("[^a-z0-9/., ]".toRegex(), " ")
+        .replace("\\s+".toRegex(), " ")
+        .trim()
+}
+
+private fun detectVoiceTransactionType(normalizedSpeech: String): TransactionType {
+    val incomeKeywords = listOf("receita", "recebi", "ganhei", "entrada", "vendi", "venda")
+    return if (incomeKeywords.any { normalizedSpeech.contains(it) }) {
+        TransactionType.RECEITA
+    } else {
+        TransactionType.DESPESA
+    }
+}
+
+private fun extractVoiceInstallments(normalizedSpeech: String): Int {
+    val match = Regex("""(?:em\s+)?(\d{1,2})\s*(?:parcelas?|vezes|x)\b""").find(normalizedSpeech)
+        ?: return 1
+    return match.groupValues.getOrNull(1)?.toIntOrNull()?.coerceAtLeast(1) ?: 1
+}
+
+private fun extractVoiceDate(normalizedSpeech: String, today: LocalDate = LocalDate.now()): LocalDate {
+    if (normalizedSpeech.contains("amanha")) return today.plusDays(1)
+    if (normalizedSpeech.contains("ontem")) return today.minusDays(1)
+    if (normalizedSpeech.contains("hoje")) return today
+
+    Regex("""\b(\d{1,2})/(\d{1,2})/(\d{4})\b""").find(normalizedSpeech)?.let { match ->
+        val day = match.groupValues[1].toIntOrNull()
+        val month = match.groupValues[2].toIntOrNull()
+        val year = match.groupValues[3].toIntOrNull()
+        if (day != null && month != null && year != null) {
+            return runCatching { LocalDate.of(year, month, day) }.getOrDefault(today)
+        }
+    }
+
+    Regex("""\b(\d{1,2})/(\d{1,2})\b""").find(normalizedSpeech)?.let { match ->
+        val day = match.groupValues[1].toIntOrNull()
+        val month = match.groupValues[2].toIntOrNull()
+        if (day != null && month != null) {
+            val baseYear = today.year
+            val sameYear = runCatching { LocalDate.of(baseYear, month, day) }.getOrNull()
+            if (sameYear != null) {
+                return if (sameYear.isBefore(today.minusMonths(6))) sameYear.plusYears(1) else sameYear
+            }
+        }
+    }
+
+    Regex("""\bdia\s+(\d{1,2})\b""").find(normalizedSpeech)?.let { match ->
+        val day = match.groupValues[1].toIntOrNull()
+        if (day != null) {
+            val sameMonth = runCatching { today.withDayOfMonth(day) }.getOrNull()
+            if (sameMonth != null) {
+                return if (sameMonth.isBefore(today.minusDays(7))) sameMonth.plusMonths(1) else sameMonth
+            }
+        }
+    }
+
+    return today
+}
+
+private fun findSpokenOption(normalizedSpeech: String, options: List<String>): String? {
+    return options
+        .filter { it.isNotBlank() }
+        .sortedByDescending { it.length }
+        .firstOrNull { option ->
+            val normalizedOption = normalizeSpeechText(option)
+            normalizedOption.isNotBlank() && normalizedSpeech.contains(normalizedOption)
+        }
+}
+
+private fun extractVoiceAmount(
+    transcript: String,
+    normalizedSpeech: String,
+    installments: Int
+): Double? {
+    val normalizedTranscript = transcript.replace(',', '.')
+    val moneyKeywordPattern =
+        Regex("""(?:r\$|reais?|valor(?:\s+de)?)\s*(\d+(?:\.\d{1,2})?)|(\d+(?:\.\d{1,2})?)\s*(?:reais?|r\$)""")
+    moneyKeywordPattern.find(normalizedTranscript)?.groups?.let { groups ->
+        val raw = groups[1]?.value ?: groups[2]?.value
+        val value = raw?.toDoubleOrNull()
+        if (value != null && value > 0.0) return value
+    }
+
+    val numberPattern = Regex("""\d+(?:[.,]\d{1,2})?""")
+    val installmentPattern = Regex("""(?:em\s+)?\d{1,2}\s*(?:parcelas?|vezes|x)\b""")
+    val candidates = numberPattern.findAll(transcript).mapNotNull { match ->
+        val raw = match.value
+        val value = raw.replace(',', '.').toDoubleOrNull() ?: return@mapNotNull null
+        if (value <= 0.0) return@mapNotNull null
+        val isDatePart = match.range.first > 0 && transcript[match.range.first - 1] == '/' ||
+            match.range.last + 1 < transcript.length && transcript[match.range.last + 1] == '/'
+        if (isDatePart) return@mapNotNull null
+        val prefix = normalizedSpeech.take(match.range.first.coerceAtMost(normalizedSpeech.length))
+        val priority = when {
+            installmentPattern.containsMatchIn(prefix.takeLast(18)) && value.toInt() == installments -> 0
+            raw.contains(',') || raw.contains('.') -> 3
+            value >= 10.0 -> 2
+            else -> 1
+        }
+        SpeechNumberCandidate(raw = raw, value = value, priority = priority)
+    }.toList()
+
+    return candidates
+        .sortedWith(compareByDescending<SpeechNumberCandidate> { it.priority }.thenByDescending { it.value })
+        .firstOrNull()
+        ?.value
+}
+
+private fun extractVoiceDescription(
+    normalizedSpeech: String,
+    amount: Double,
+    installments: Int,
+    type: TransactionType,
+    category: String,
+    paymentMethod: String
+): String {
+    var cleaned = normalizedSpeech
+    val typeKeywords = if (type == TransactionType.RECEITA) {
+        listOf("receita", "recebi", "ganhei", "entrada", "vendi", "venda")
+    } else {
+        listOf("despesa", "gastei", "paguei", "saida", "saidas")
+    }
+    typeKeywords.forEach { cleaned = cleaned.replace("\\b$it\\b".toRegex(), " ") }
+    cleaned = cleaned.replace("\\bhoje\\b|\\bamanha\\b|\\bontem\\b".toRegex(), " ")
+    cleaned = cleaned.replace("\\bdia\\s+\\d{1,2}\\b".toRegex(), " ")
+    cleaned = cleaned.replace("\\b\\d{1,2}/\\d{1,2}(?:/\\d{4})?\\b".toRegex(), " ")
+    cleaned = cleaned.replace("\\b(?:em\\s+)?$installments\\s*(?:parcelas?|vezes|x)\\b".toRegex(), " ")
+
+    listOf(category, paymentMethod).forEach { option ->
+        val normalizedOption = normalizeSpeechText(option)
+        if (normalizedOption.isNotBlank()) {
+            cleaned = cleaned.replace("\\b${Regex.escape(normalizedOption)}\\b".toRegex(), " ")
+        }
+    }
+
+    val integerAmount = amount.toInt()
+    cleaned = cleaned.replace("\\b${Regex.escape(integerAmount.toString())}\\b".toRegex(), " ")
+    cleaned = cleaned.replace(
+        "\\b${Regex.escape(String.format(Locale.US, "%.2f", amount))}\\b".toRegex(),
+        " "
+    )
+    cleaned = cleaned.replace("\\b${Regex.escape(amount.toString().replace('.', ','))}\\b".toRegex(), " ")
+
+    return cleaned
+        .replace("\\s+".toRegex(), " ")
+        .trim()
+        .ifBlank { "Sem descricao" }
+}
+
+private fun parseVoiceTransactionDraft(
+    transcript: String,
+    expenseCategories: List<String>,
+    incomeCategories: List<String>,
+    paymentMethods: List<String>
+): VoiceTransactionDraft? {
+    val normalizedSpeech = normalizeSpeechText(transcript)
+    if (normalizedSpeech.isBlank()) return null
+
+    val type = detectVoiceTransactionType(normalizedSpeech)
+    val installments = extractVoiceInstallments(normalizedSpeech)
+    val amount = extractVoiceAmount(transcript, normalizedSpeech, installments) ?: return null
+    val launchDate = extractVoiceDate(normalizedSpeech)
+    val categoryOptions = if (type == TransactionType.RECEITA) incomeCategories else expenseCategories
+    val category = findSpokenOption(normalizedSpeech, categoryOptions) ?: "Sem categoria"
+    val paymentMethod = findSpokenOption(normalizedSpeech, paymentMethods)
+        ?: paymentMethods.firstOrNull().orEmpty().ifBlank { "Dinheiro" }
+    val title = extractVoiceDescription(
+        normalizedSpeech = normalizedSpeech,
+        amount = amount,
+        installments = installments,
+        type = type,
+        category = category,
+        paymentMethod = paymentMethod
+    )
+
+    return VoiceTransactionDraft(
+        transcript = transcript.trim(),
+        title = title,
+        amount = amount,
+        type = type,
+        category = category,
+        paymentMethod = paymentMethod,
+        installments = installments,
+        launchDate = launchDate
+    )
 }
 
 private fun loadPersistedList(
@@ -989,6 +1198,7 @@ fun FinanceApp(
     var pendingDeleteItem by remember { mutableStateOf<FinancialTransactionEntity?>(null) }
     var pendingClearAllFromActiveAccount by remember { mutableStateOf(false) }
     var monthlyLimitAlertMessage by remember { mutableStateOf<String?>(null) }
+    var pendingVoiceDraft by remember { mutableStateOf<VoiceTransactionDraft?>(null) }
     var notificationsEnabled by remember {
         mutableStateOf(NotificationScheduler.isDailyReminderEnabled(context))
     }
@@ -1011,6 +1221,111 @@ fun FinanceApp(
         androidx.compose.runtime.mutableStateMapOf<Long, Long>().apply {
             putAll(loadPersistedLongMap(prefs, concludedDatesPrefKey))
         }
+    }
+
+    fun saveVoiceTransaction(draft: VoiceTransactionDraft) {
+        val categoryMonthlyLimit =
+            if (draft.type == TransactionType.DESPESA) expenseCategoryLimits[draft.category.trim()] else null
+        val isCardPayment = isCardPaymentMethod(draft.paymentMethod)
+        val cardConfig = if (isCardPayment) paymentMethodCardConfigs[draft.paymentMethod] else null
+        if (isCardPayment && cardConfig == null) {
+            Toast.makeText(
+                context,
+                "Configure fechamento e pagamento para ${draft.paymentMethod} antes de usar voz.",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+
+        val launchDateMillis = draft.launchDate
+            .atStartOfDay(ZoneId.systemDefault())
+            .toInstant()
+            .toEpochMilli()
+        val cardPaymentMillis = if (isCardPayment) {
+            computeCardPaymentDate(
+                launchDate = draft.launchDate,
+                closingDay = cardConfig?.closingDay ?: 25,
+                paymentDay = cardConfig?.paymentDay ?: 5
+            ).atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
+        } else {
+            null
+        }
+
+        viewModel.saveTransaction(
+            currentId = null,
+            title = draft.title,
+            amount = draft.amount,
+            type = draft.type,
+            category = draft.category,
+            paymentMethod = draft.paymentMethod,
+            installments = draft.installments,
+            cardPaymentDateMillis = cardPaymentMillis,
+            notes = "",
+            dateMillis = launchDateMillis,
+            categoryMonthlyLimit = categoryMonthlyLimit
+        ) { warning ->
+            if (!warning.isNullOrBlank()) {
+                monthlyLimitAlertMessage = warning
+            }
+        }
+        Toast.makeText(
+            context,
+            "Lançamento por voz salvo: ${moneyFormat.format(draft.amount)} em ${draft.category}.",
+            Toast.LENGTH_LONG
+        ).show()
+        editingItem = null
+        startDateText = ""
+        endDateText = ""
+        formResetTrigger++
+        telaAtiva = TelaAtiva.EXTRATO
+    }
+
+    val voiceRecognitionLauncher =
+        rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode != android.app.Activity.RESULT_OK) return@rememberLauncherForActivityResult
+            val transcript = result.data
+                ?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+                ?.firstOrNull()
+                ?.trim()
+                .orEmpty()
+            if (transcript.isBlank()) {
+                Toast.makeText(context, "Nenhum comando de voz foi reconhecido.", Toast.LENGTH_SHORT).show()
+                return@rememberLauncherForActivityResult
+            }
+
+            val draft = parseVoiceTransactionDraft(
+                transcript = transcript,
+                expenseCategories = expenseCategories.toList(),
+                incomeCategories = incomeCategories.toList(),
+                paymentMethods = paymentMethods.toList()
+            )
+            if (draft == null) {
+                Toast.makeText(
+                    context,
+                    "Nao entendi o valor. Exemplo: despesa 35 mercado pix hoje.",
+                    Toast.LENGTH_LONG
+                ).show()
+                return@rememberLauncherForActivityResult
+            }
+            pendingVoiceDraft = draft
+        }
+
+    fun launchVoiceTransactionCapture() {
+        val voiceIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "pt-BR")
+            putExtra(RecognizerIntent.EXTRA_PROMPT, "Fale um lançamento. Ex.: despesa 35 mercado pix hoje")
+        }
+        val canHandle = voiceIntent.resolveActivity(context.packageManager) != null
+        if (!canHandle) {
+            Toast.makeText(
+                context,
+                "Nao encontrei reconhecimento de voz disponivel neste aparelho.",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+        voiceRecognitionLauncher.launch(voiceIntent)
     }
 
     LaunchedEffect(concludedDateByTransactionId, concludedDatesPrefKey) {
@@ -1603,6 +1918,10 @@ fun FinanceApp(
                 showPersonDialog = false
                 showShareDialog = true
             },
+            onVoiceLaunch = {
+                showPersonDialog = false
+                launchVoiceTransactionCapture()
+            },
             isDarkTheme = isDarkTheme,
             onThemeChange = onThemeChange,
             screenOrder = screenOrder,
@@ -1621,6 +1940,19 @@ fun FinanceApp(
                 }
             },
             isCheckingUpdate = checkingForAppUpdate
+        )
+    }
+    pendingVoiceDraft?.let { draft ->
+        VoiceTransactionReviewDialog(
+            draft = draft,
+            expenseCategories = expenseCategories.toList(),
+            incomeCategories = incomeCategories.toList(),
+            paymentMethods = paymentMethods.toList(),
+            onDismiss = { pendingVoiceDraft = null },
+            onConfirm = { reviewedDraft ->
+                pendingVoiceDraft = null
+                saveVoiceTransaction(reviewedDraft)
+            }
         )
     }
     pendingAppUpdate?.let { update ->
@@ -1867,6 +2199,7 @@ private fun PersonFormDialog(
     onFindByAny: suspend (String, String, String) -> PersonEntity?,
     resolveAccountPhotoUri: (Long?) -> String?,
     onShareAccount: () -> Unit,
+    onVoiceLaunch: () -> Unit,
     isDarkTheme: Boolean,
     onThemeChange: (Boolean) -> Unit,
     screenOrder: List<TelaAtiva>,
@@ -2065,6 +2398,13 @@ private fun PersonFormDialog(
                 }
                 HorizontalDivider()
                 Text("Ações da conta", fontWeight = FontWeight.SemiBold)
+                OutlinedButton(
+                    onClick = onVoiceLaunch,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text("Lançamento por voz", fontWeight = FontWeight.SemiBold)
+                }
                 OutlinedButton(
                     onClick = onShareAccount,
                     modifier = Modifier.fillMaxWidth(),
@@ -2833,6 +3173,162 @@ private fun ToggleTypeButton(
             maxLines = 2
         )
     }
+}
+
+@Composable
+private fun VoiceTransactionReviewDialog(
+    draft: VoiceTransactionDraft,
+    expenseCategories: List<String>,
+    incomeCategories: List<String>,
+    paymentMethods: List<String>,
+    onDismiss: () -> Unit,
+    onConfirm: (VoiceTransactionDraft) -> Unit
+) {
+    var type by remember(draft) { mutableStateOf(draft.type) }
+    var amountText by remember(draft) {
+        mutableStateOf(String.format(Locale.forLanguageTag("pt-BR"), "%.2f", draft.amount))
+    }
+    var title by remember(draft) { mutableStateOf(draft.title) }
+    var category by remember(draft) { mutableStateOf(draft.category) }
+    var paymentMethod by remember(draft) { mutableStateOf(draft.paymentMethod) }
+    var installmentsText by remember(draft) { mutableStateOf(draft.installments.toString()) }
+    var launchDateText by remember(draft) { mutableStateOf(draft.launchDate.format(fullDateFormat)) }
+    var error by remember(draft) { mutableStateOf<String?>(null) }
+
+    val categoryOptions = if (type == TransactionType.RECEITA) incomeCategories else expenseCategories
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = appSurface,
+        title = { Text("Confirmar lançamento por voz") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 520.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    "Ouvido: \"${draft.transcript}\"",
+                    color = appTextSecondary
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    ToggleTypeButton(
+                        label = "Despesa",
+                        selected = type == TransactionType.DESPESA,
+                        selectedColor = expenseRed,
+                        onClick = { type = TransactionType.DESPESA },
+                        modifier = Modifier.weight(1f)
+                    )
+                    ToggleTypeButton(
+                        label = "Receita",
+                        selected = type == TransactionType.RECEITA,
+                        selectedColor = incomeGreen,
+                        onClick = { type = TransactionType.RECEITA },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                OutlinedTextField(
+                    value = amountText,
+                    onValueChange = { amountText = it.filter { ch -> ch.isDigit() || ch == ',' || ch == '.' } },
+                    label = { Text("Valor") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    colors = financeOutlinedTextFieldColors(),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = title,
+                    onValueChange = { title = it },
+                    label = { Text("Descrição") },
+                    singleLine = true,
+                    colors = financeOutlinedTextFieldColors(),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = category,
+                    onValueChange = { category = it },
+                    label = { Text("Categoria") },
+                    singleLine = true,
+                    supportingText = {
+                        val hint = categoryOptions.take(4).joinToString(", ")
+                        if (hint.isNotBlank()) Text("Sugestões: $hint")
+                    },
+                    colors = financeOutlinedTextFieldColors(),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = paymentMethod,
+                    onValueChange = { paymentMethod = it },
+                    label = { Text("Pagamento") },
+                    singleLine = true,
+                    supportingText = {
+                        val hint = paymentMethods.take(4).joinToString(", ")
+                        if (hint.isNotBlank()) Text("Sugestões: $hint")
+                    },
+                    colors = financeOutlinedTextFieldColors(),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = installmentsText,
+                    onValueChange = { installmentsText = it.filter(Char::isDigit) },
+                    label = { Text("Parcelas") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    colors = financeOutlinedTextFieldColors(),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = launchDateText,
+                    onValueChange = { launchDateText = it },
+                    label = { Text("Data") },
+                    placeholder = { Text("dd/MM/yyyy") },
+                    singleLine = true,
+                    colors = financeOutlinedTextFieldColors(),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                error?.let { Text(it, color = expenseRed) }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancelar") }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    val parsedAmount = amountText.replace(",", ".").toDoubleOrNull()
+                    val parsedInstallments = installmentsText.toIntOrNull()?.coerceAtLeast(1) ?: 1
+                    val parsedDate = parseDateOrNull(launchDateText)
+                    when {
+                        parsedAmount == null || parsedAmount <= 0.0 -> error = "Valor invalido."
+                        parsedDate == null -> error = "Data invalida. Use dd/MM/yyyy."
+                        title.trim().isBlank() -> error = "Informe a descricao."
+                        category.trim().isBlank() -> error = "Informe a categoria."
+                        paymentMethod.trim().isBlank() -> error = "Informe o pagamento."
+                        else -> {
+                            error = null
+                            onConfirm(
+                                VoiceTransactionDraft(
+                                    transcript = draft.transcript,
+                                    title = title.trim(),
+                                    amount = parsedAmount,
+                                    type = type,
+                                    category = category.trim(),
+                                    paymentMethod = paymentMethod.trim(),
+                                    installments = parsedInstallments,
+                                    launchDate = parsedDate
+                                )
+                            )
+                        }
+                    }
+                }
+            ) { Text("Salvar") }
+        }
+    )
 }
 
 @Composable
