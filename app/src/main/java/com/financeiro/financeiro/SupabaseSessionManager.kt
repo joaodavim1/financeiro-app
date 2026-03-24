@@ -268,6 +268,10 @@ class SupabaseSessionManager(
         return when {
             rawMessage.contains("email not confirmed", ignoreCase = true) ->
                 "Confirme o email no Supabase antes de entrar."
+            rawMessage.contains("unacceptable audience", ignoreCase = true) ->
+                "Login Google rejeitado pelo Supabase. O app esta usando o Web client ID " +
+                    "${BuildConfig.GOOGLE_WEB_CLIENT_ID}; esse mesmo client ID precisa estar " +
+                    "configurado e autorizado no provedor Google do Supabase."
             rawMessage.contains("invalid login credentials", ignoreCase = true) ->
                 "Link ou código de recuperação inválido. Peça um novo email."
             rawMessage.contains("rate limit", ignoreCase = true) ||
